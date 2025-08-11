@@ -6,6 +6,9 @@ from llm.llm_clients import LLMClient, create_llm_client
 from rag.retriever import RAGRetriever
 from core.data_processor import DealDataProcessor
 from config.settings import settings
+from utils.security import sanitize_input
+from core.incremental_processor import IncrementalActivityProcessor
+from utils.metrics import metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ class ClientSentimentAnalyzer:
         self.llm_client = llm_client
         self.rag_retriever = rag_retriever
         self.data_processor = data_processor
+        self.incremental_processor = IncrementalActivityProcessor()
         
         logger.info("Client Sentiment Analyzer initialized")
     
@@ -40,139 +44,146 @@ class ClientSentimentAnalyzer:
         deal_data: Dict[str, Any],
         include_rag_context: bool = True
     ) -> Dict[str, Any]:
-        """
-        Perform client sentiment analysis on a deal
-        
-        Args:
-            deal_data: Deal data including activities and metadata
-            include_rag_context: Whether to include RAG context
-            
-        Returns:
-            Client sentiment analysis result
-        """
-        
-        try:
-            deal_id = deal_data.get('deal_id', 'unknown')
-            logger.info(f"Analyzing client sentiment for deal {deal_id}")
-            
-            # Always extract RAG metadata directly from deal_data root level
-            rag_metadata = {
-                'deal_amount': self._safe_float(deal_data.get('amount', 0)),
-                'deal_stage': deal_data.get('dealstage', 'unknown'),
-                'deal_type': deal_data.get('dealtype', 'unknown'),
-                'deal_probability': self._safe_float(deal_data.get('deal_stage_probability', 0)),
-                'outcome': self._determine_outcome(deal_data.get('dealstage', 'unknown')),
-                'total_activities': len(deal_data.get('activities', [])),
-                'time_span_days': 0,
-                'communication_gaps_count': 0
-            }
-            
-            # Extract client-initiated activities
-            raw_activities = deal_data.get('activities', [])
-            client_activities = self._filter_client_activities(raw_activities)
-            
-            # Process client activities
-            if self.data_processor:
-                # Create temporary deal data with only client activities
-                client_deal_data = deal_data.copy()
-                client_deal_data['activities'] = client_activities
+        op_name = "analyze_client_sentiment"
+        with metrics_collector.track_operation(op_name):
+            try:
+                deal_id = deal_data.get('deal_id', 'unknown')
+                logger.info(f"Analyzing client sentiment for deal {deal_id}")
                 
-                processed_deal = self.data_processor.process_deal(client_deal_data)
-                activities = [
-                    {
-                        'activity_type': activity.activity_type,
-                        'content': activity.content,
-                        'timestamp': activity.timestamp.isoformat() if activity.timestamp else None,
-                        'direction': activity.direction,
-                        'metadata': activity.metadata
-                    }
-                    for activity in processed_deal.processed_activities
-                ]
+                # Always extract RAG metadata directly from deal_data root level
+                rag_metadata = {
+                    'deal_amount': self._safe_float(deal_data.get('amount', 0)),
+                    'deal_stage': deal_data.get('dealstage', 'unknown'),
+                    'deal_type': deal_data.get('dealtype', 'unknown'),
+                    'deal_probability': self._safe_float(deal_data.get('deal_stage_probability', 0)),
+                    'outcome': self._determine_outcome(deal_data.get('dealstage', 'unknown')),
+                    'total_activities': len(deal_data.get('activities', [])),
+                    'time_span_days': 0,
+                    'communication_gaps_count': 0
+                }
                 
-                # Update RAG metadata with processed metrics for client activities
-                rag_metadata.update({
-                    'total_activities': len(client_activities),
-                    'time_span_days': processed_deal.deal_metrics.time_span_days,
-                    'communication_gaps_count': processed_deal.deal_metrics.communication_gaps_count
-                })
-                
-                activities_text = processed_deal.combined_text
-            else:
-                # Use raw client activities
-                activities = [
-                    {
-                        'activity_type': activity.get('activity_type', 'unknown'),
-                        'content': self._extract_raw_activity_content(activity),
-                        'timestamp': activity.get('sent_at') or activity.get('createdate') or activity.get('meeting_start_time') or activity.get('lastmodifieddate'),
-                        'direction': activity.get('direction') or activity.get('call_direction') or 'unknown',
-                        'metadata': activity
-                    }
-                    for activity in client_activities
-                ]
-                activities_text = self._create_client_activities_text(client_activities)
-            
-            # Get RAG context if requested (specify client analysis type)
-            rag_context = ""
-            if include_rag_context:
-                try:
-                    # Use all activities for finding similar deals, but focus on client engagement
-                    all_activities = [
+                # Extract client-initiated activities
+                raw_activities = deal_data.get('activities', [])
+                client_activities = self._filter_client_activities(raw_activities)
+                # Incremental activity processing
+                new_activities = self.incremental_processor.detect_new_or_updated_activities(deal_id, client_activities)
+                previous_result = None
+                cache_key = f"client_sentiment_result:{deal_id}"
+                from utils.cache import get_cache_manager
+                cache = get_cache_manager()
+                previous_result = cache.get(cache_key, default=None, cache_type="incremental")
+
+                if not new_activities and previous_result:
+                    logger.info(f"No new client activities for deal {deal_id}, returning cached result.")
+                    return previous_result
+
+                # Process only new/updated client activities
+                if self.data_processor:
+                    client_deal_data = deal_data.copy()
+                    client_deal_data['activities'] = new_activities
+                    processed_deal = self.data_processor.process_deal(client_deal_data)
+                    activities = [
+                        {
+                            'activity_type': activity.activity_type,
+                            'content': activity.content,
+                            'timestamp': activity.timestamp.isoformat() if activity.timestamp else None,
+                            'direction': activity.direction,
+                            'metadata': activity.metadata
+                        }
+                        for activity in processed_deal.processed_activities
+                    ]
+                    rag_metadata.update({
+                        'total_activities': len(client_activities),
+                        'time_span_days': processed_deal.deal_metrics.time_span_days,
+                        'communication_gaps_count': processed_deal.deal_metrics.communication_gaps_count
+                    })
+                    activities_text = processed_deal.combined_text
+                else:
+                    activities = [
                         {
                             'activity_type': activity.get('activity_type', 'unknown'),
                             'content': self._extract_raw_activity_content(activity),
-                            'timestamp': activity.get('sent_at') or activity.get('createdate'),
-                            'direction': activity.get('direction') or 'unknown',
+                            'timestamp': activity.get('sent_at') or activity.get('createdate') or activity.get('meeting_start_time') or activity.get('lastmodifieddate'),
+                            'direction': activity.get('direction') or activity.get('call_direction') or 'unknown',
                             'metadata': activity
                         }
-                        for activity in raw_activities
+                        for activity in new_activities
                     ]
-                    
-                    # Request client-specific context
-                    rag_context = self.rag_retriever.retrieve_relevant_examples(
-                        deal_id=deal_id,
-                        activities=all_activities,
-                        metadata=rag_metadata,
-                        analysis_type="client"  # Specify client analysis
-                    )
-                except Exception as e:
-                    logger.error(f"Error retrieving RAG context: {e}")
-                    rag_context = "Error retrieving historical context."
-            
-            # Analyze client sentiment using client-specific LLM
-            sentiment_result = self.llm_client.analyze_sentiment(
-                deal_id=deal_id,
-                activities_text=activities_text,
-                rag_context=rag_context,
-                activity_frequency=len(client_activities),
-                total_activities=len(client_activities)
-            )
-            
-            # Add client-specific analysis metadata
-            sentiment_result.update({
-                'analysis_metadata': {
-                    'deal_id': deal_id,
-                    'analysis_timestamp': datetime.utcnow().isoformat(),
-                    'llm_provider': self.llm_client.provider.get_provider_name(),
-                    'included_rag_context': include_rag_context,
-                    'total_client_activities_analyzed': len(client_activities),
-                    'total_deal_activities': len(raw_activities),
-                    'rag_context_length': len(rag_context) if rag_context else 0,
-                    'analysis_type': 'client_sentiment',
-                    'client_activity_filter_applied': True
+                    activities_text = self._create_client_activities_text(new_activities)
+                
+                # Sanitize activities text before sending to LLM
+                from utils.security import sanitize_input
+                sanitized_activities_text = sanitize_input(activities_text, f"client_sentiment_activities_{deal_id}").cleaned_content
+                
+                # Get RAG context if requested (specify client analysis type)
+                rag_context = ""
+                if include_rag_context:
+                    try:
+                        all_activities = [
+                            {
+                                'activity_type': activity.get('activity_type', 'unknown'),
+                                'content': self._extract_raw_activity_content(activity),
+                                'timestamp': activity.get('sent_at') or activity.get('createdate'),
+                                'direction': activity.get('direction') or 'unknown',
+                                'metadata': activity
+                            }
+                            for activity in raw_activities
+                        ]
+                        rag_context = self.rag_retriever.retrieve_relevant_examples(
+                            deal_id=deal_id,
+                            activities=all_activities,
+                            metadata=rag_metadata,
+                            analysis_type="client"
+                        )
+                    except Exception as e:
+                        logger.error(f"Error retrieving RAG context: {e}")
+                        rag_context = "Error retrieving historical context."
+                
+                # Sanitize RAG context
+                sanitized_rag_context = sanitize_input(rag_context, f"client_sentiment_rag_{deal_id}").cleaned_content
+                
+                # Analyze client sentiment using client-specific LLM
+                sentiment_result = self.llm_client.analyze_sentiment(
+                    deal_id=deal_id,
+                    activities_text=sanitized_activities_text,
+                    rag_context=sanitized_rag_context,
+                    activity_frequency=len(new_activities),
+                    total_activities=len(new_activities)
+                )
+                
+                # Add client-specific analysis metadata
+                sentiment_result.update({
+                    'analysis_metadata': {
+                        'deal_id': deal_id,
+                        'analysis_timestamp': datetime.utcnow().isoformat(),
+                        'llm_provider': self.llm_client.provider.get_provider_name(),
+                        'included_rag_context': include_rag_context,
+                        'total_client_activities_analyzed': len(new_activities),
+                        'total_deal_activities': len(raw_activities),
+                        'rag_context_length': len(rag_context) if rag_context else 0,
+                        'analysis_type': 'client_sentiment',
+                        'client_activity_filter_applied': True,
+                        'incremental': True,
+                        'new_activities_count': len(new_activities)
+                    }
+                })
+                
+                logger.info(f"Client sentiment analysis completed for deal {deal_id}")
+                # Merge with previous result if exists
+                merged_result = self.incremental_processor.merge_results(previous_result, sentiment_result)
+                # Update state in cache
+                self.incremental_processor.update_state_after_processing(deal_id, client_activities)
+                cache.set(cache_key, merged_result, ttl=86400, cache_type="incremental")
+                return merged_result
+            except Exception as e:
+                logger.error(f"Error analyzing client sentiment for deal {deal_data.get('deal_id', 'unknown')}: {e}")
+                metrics_collector.record_error(type(e).__name__)
+                return {
+                    'error': str(e),
+                    'deal_id': deal_data.get('deal_id', 'unknown'),
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'analysis_type': 'client_sentiment'
                 }
-            })
-            
-            logger.info(f"Client sentiment analysis completed for deal {deal_id}")
-            return sentiment_result
-            
-        except Exception as e:
-            logger.error(f"Error analyzing client sentiment for deal {deal_data.get('deal_id', 'unknown')}: {e}")
-            return {
-                'error': str(e),
-                'deal_id': deal_data.get('deal_id', 'unknown'),
-                'timestamp': datetime.utcnow().isoformat(),
-                'analysis_type': 'client_sentiment'
-            }
     
     def _filter_client_activities(self, activities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -315,55 +326,55 @@ class ClientSentimentAnalyzer:
         deals_data: List[Dict[str, Any]],
         include_rag_context: bool = True
     ) -> Dict[str, Any]:
-        """Perform batch client sentiment analysis on multiple deals"""
-        
-        start_time = datetime.utcnow()
-        
-        results = []
-        successful_analyses = 0
-        failed_analyses = 0
-        
-        logger.info(f"Starting batch client sentiment analysis for {len(deals_data)} deals")
-        
-        for i, deal_data in enumerate(deals_data):
-            try:
-                result = self.analyze_client_sentiment(deal_data, include_rag_context)
-                
-                if 'error' not in result:
-                    successful_analyses += 1
-                else:
+        op_name = "analyze_batch_client_sentiment"
+        with metrics_collector.track_operation(op_name):
+            start_time = datetime.utcnow()
+            
+            results = []
+            successful_analyses = 0
+            failed_analyses = 0
+            
+            logger.info(f"Starting batch client sentiment analysis for {len(deals_data)} deals")
+            
+            for i, deal_data in enumerate(deals_data):
+                try:
+                    result = self.analyze_client_sentiment(deal_data, include_rag_context)
+                    
+                    if 'error' not in result:
+                        successful_analyses += 1
+                    else:
+                        failed_analyses += 1
+                    
+                    results.append(result)
+                    
+                    if (i + 1) % 10 == 0:
+                        logger.info(f"Processed {i + 1}/{len(deals_data)} deals")
+                    
+                except Exception as e:
+                    logger.error(f"Error in batch client analysis for deal {deal_data.get('deal_id', 'unknown')}: {e}")
                     failed_analyses += 1
-                
-                results.append(result)
-                
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Processed {i + 1}/{len(deals_data)} deals")
-                
-            except Exception as e:
-                logger.error(f"Error in batch client analysis for deal {deal_data.get('deal_id', 'unknown')}: {e}")
-                failed_analyses += 1
-                results.append({
-                    'error': str(e),
-                    'deal_id': deal_data.get('deal_id', 'unknown'),
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'analysis_type': 'client_sentiment'
-                })
-        
-        end_time = datetime.utcnow()
-        processing_time = (end_time - start_time).total_seconds()
-        
-        batch_summary = {
-            'total_deals': len(deals_data),
-            'successful_analyses': successful_analyses,
-            'failed_analyses': failed_analyses,
-            'results': results,
-            'processing_time_seconds': processing_time,
-            'timestamp': datetime.utcnow().isoformat(),
-            'analysis_type': 'client_sentiment_batch'
-        }
-        
-        logger.info(f"Batch client sentiment analysis completed: {successful_analyses} successful, {failed_analyses} failed")
-        return batch_summary
+                    results.append({
+                        'error': str(e),
+                        'deal_id': deal_data.get('deal_id', 'unknown'),
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'analysis_type': 'client_sentiment'
+                    })
+            
+            end_time = datetime.utcnow()
+            processing_time = (end_time - start_time).total_seconds()
+            
+            batch_summary = {
+                'total_deals': len(deals_data),
+                'successful_analyses': successful_analyses,
+                'failed_analyses': failed_analyses,
+                'results': results,
+                'processing_time_seconds': processing_time,
+                'timestamp': datetime.utcnow().isoformat(),
+                'analysis_type': 'client_sentiment_batch'
+            }
+            
+            logger.info(f"Batch client sentiment analysis completed: {successful_analyses} successful, {failed_analyses} failed")
+            return batch_summary
     
     def get_analyzer_stats(self) -> Dict[str, Any]:
         """Get analyzer statistics"""
