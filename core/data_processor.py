@@ -7,6 +7,7 @@ from pathlib import Path
 from models.schemas import ProcessedActivity, DealPattern, ProcessedDealData, DealMetrics, DealCharacteristics
 from core.embedding_service import EmbeddingService
 from config.settings import settings
+from utils.security import SecurityMiddleware, get_default_sanitizer
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,8 @@ class DealDataProcessor:
             embedding_service: Initialized embedding service instance
         """
         self.embedding_service = embedding_service
-        logger.info("Deal Data Processor initialized")
+        self.security_middleware = SecurityMiddleware(get_default_sanitizer())
+        logger.info("Deal Data Processor initialized with security middleware")
     
     def load_deal_data(self, file_path: str) -> List[Dict[str, Any]]:
         """Load deal data from JSON file"""
@@ -45,13 +47,16 @@ class DealDataProcessor:
             Processed deal data
         """
         
-        # logger.info(deal_data)
+        # Sanitize input data to prevent prompt injection attacks
+        sanitized_deal_data = self.security_middleware.sanitize_deal_data(deal_data)
+        
+        # logger.info(sanitized_deal_data)
 
-        deal_id = str(deal_data.get('deal_id', 'unknown'))
+        deal_id = str(sanitized_deal_data.get('deal_id', 'unknown'))
         
         try:
             # Process activities
-            activities = deal_data.get('activities', [])
+            activities = sanitized_deal_data.get('activities', [])
             processed_activities = [
                 self._parse_activity(activity, deal_id) 
                 for activity in activities
@@ -61,10 +66,10 @@ class DealDataProcessor:
             processed_activities = [a for a in processed_activities if a is not None]
             
             # Calculate metrics
-            deal_metrics = self._calculate_deal_metrics(processed_activities, deal_data)
+            deal_metrics = self._calculate_deal_metrics(processed_activities, sanitized_deal_data)
             
             # Extract characteristics
-            deal_characteristics = self._extract_deal_characteristics(deal_data, deal_metrics)
+            deal_characteristics = self._extract_deal_characteristics(sanitized_deal_data, deal_metrics)
             
             # logger.info(f"Deal id: {deal_id} -- {deal_characteristics}")
 
@@ -81,7 +86,7 @@ class DealDataProcessor:
             
             return ProcessedDealData(
                 deal_id=deal_id,
-                raw_deal_data=deal_data,
+                raw_deal_data=sanitized_deal_data,
                 processed_activities=processed_activities,
                 deal_metrics=deal_metrics,
                 deal_characteristics=deal_characteristics,
@@ -222,7 +227,18 @@ class DealDataProcessor:
             if body:
                 content_parts.append(f"Details: {body}")
         
-        return '\n'.join(content_parts)
+        # Combine content parts
+        combined_content = '\n'.join(content_parts)
+        
+        # Apply additional sanitization to the extracted content
+        if combined_content.strip():
+            sanitized_content = self.security_middleware.sanitize_activity_content(
+                combined_content, 
+                activity_type
+            )
+            return sanitized_content
+        
+        return combined_content
     
     def _extract_activity_timestamp(self, activity: Dict[str, Any]) -> Optional[datetime]:
         """Extract timestamp from activity"""
