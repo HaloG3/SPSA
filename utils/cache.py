@@ -225,35 +225,74 @@ class CacheManager:
         cache_key = self._generate_embedding_key(text, model_name)
         return self.get(cache_key, cache_type="embedding")
     
-    def cache_llm_response(self, prompt: str, response: str, model_name: str) -> bool:
+    def cache_llm_response(
+        self, 
+        prompt: str, 
+        response: str, 
+        model_name: str,
+        deal_id: str = None,
+        analysis_type: str = None,
+        include_rag_context: bool = None,
+        cache_version: str = "v1"
+    ) -> bool:
         """
-        Cache LLM response
+        Cache LLM response with comprehensive context
         
         Args:
             prompt: LLM prompt
             response: LLM response
             model_name: Model name
+            deal_id: Deal ID for context
+            analysis_type: Type of analysis (sales/client)
+            include_rag_context: Whether RAG context was included
+            cache_version: Cache version for invalidation
             
         Returns:
             True if successful
         """
         
-        cache_key = self._generate_llm_key(prompt, model_name)
+        cache_key = self._generate_llm_key(
+            prompt=prompt,
+            model_name=model_name,
+            deal_id=deal_id,
+            analysis_type=analysis_type,
+            include_rag_context=include_rag_context,
+            cache_version=cache_version
+        )
         return self.set(cache_key, response, ttl=settings.LLM_CACHE_TTL, cache_type="llm")
     
-    def get_cached_llm_response(self, prompt: str, model_name: str) -> Optional[str]:
+    def get_cached_llm_response(
+        self, 
+        prompt: str, 
+        model_name: str,
+        deal_id: str = None,
+        analysis_type: str = None,
+        include_rag_context: bool = None,
+        cache_version: str = "v1"
+    ) -> Optional[str]:
         """
-        Get cached LLM response
+        Get cached LLM response with comprehensive context
         
         Args:
             prompt: LLM prompt
             model_name: Model name
+            deal_id: Deal ID for context
+            analysis_type: Type of analysis (sales/client)
+            include_rag_context: Whether RAG context was included
+            cache_version: Cache version for invalidation
             
         Returns:
             Cached response or None
         """
         
-        cache_key = self._generate_llm_key(prompt, model_name)
+        cache_key = self._generate_llm_key(
+            prompt=prompt,
+            model_name=model_name,
+            deal_id=deal_id,
+            analysis_type=analysis_type,
+            include_rag_context=include_rag_context,
+            cache_version=cache_version
+        )
         return self.get(cache_key, cache_type="llm")
     
     def _generate_embedding_key(self, text: str, model_name: str) -> str:
@@ -261,10 +300,49 @@ class CacheManager:
         text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
         return f"{model_name}_{text_hash}"
     
-    def _generate_llm_key(self, prompt: str, model_name: str) -> str:
-        """Generate cache key for LLM responses"""
-        prompt_hash = hashlib.md5(prompt.encode('utf-8')).hexdigest()
-        return f"{model_name}_{prompt_hash}"
+    def _generate_llm_key(
+        self,
+        prompt: str,
+        model_name: str,
+        deal_id: str = None,
+        analysis_type: str = None,
+        include_rag_context: bool = None,
+        cache_version: str = "v1"
+    ) -> str:
+        """
+        Generate comprehensive cache key for LLM responses
+        
+        Args:
+            prompt: LLM prompt
+            model_name: Model name
+            deal_id: Deal ID for context
+            analysis_type: Type of analysis (sales/client)
+            include_rag_context: Whether RAG context was included
+            cache_version: Cache version for invalidation
+            
+        Returns:
+            Unique cache key
+        """
+        
+        # Create context dictionary with all relevant parameters
+        context_dict = {
+            'prompt_hash': hashlib.md5(prompt.encode('utf-8')).hexdigest(),
+            'model_name': model_name,
+            'deal_id': deal_id or 'unknown',
+            'analysis_type': analysis_type or 'unknown',
+            'include_rag_context': include_rag_context,
+            'cache_version': cache_version
+        }
+        
+        # Convert to sorted JSON string for consistent hashing
+        context_json = json.dumps(context_dict, sort_keys=True, separators=(',', ':'))
+        
+        # Generate final hash
+        cache_key = hashlib.sha256(context_json.encode('utf-8')).hexdigest()
+        
+        logger.debug(f"Generated cache key: {cache_key[:16]}... for deal {deal_id}, analysis {analysis_type}")
+        
+        return cache_key
     
     def health_check(self) -> Dict[str, Any]:
         """

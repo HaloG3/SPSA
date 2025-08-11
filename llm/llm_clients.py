@@ -12,6 +12,10 @@ import anthropic
 from groq import Groq
 
 from config.settings import settings
+from models.validators import validate_llm_response, get_response_validator, ClientSentimentResponse, SalesSentimentResponse
+from utils.cache import get_cache_manager
+from utils.token_manager import TokenManager
+from utils.metrics import metrics_collector
 
 logger = logging.getLogger(__name__)
 
@@ -426,7 +430,7 @@ class LLMClient:
         Args:
             provider: LLM provider instance
             prompt_file_path: Path to prompt template file
-            max_retries: Maximum number of retry attempts
+            max_retries: Maximum number of retries
             retry_delay: Delay between retries in seconds
             analysis_type: Type of analysis (sales or client)
         """
@@ -435,8 +439,9 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.analysis_type = analysis_type
-        
-        logger.info(f"Initialized LLM client with provider: {provider.get_provider_name()}, analysis type: {analysis_type}")
+        self.cache_manager = get_cache_manager()
+        self.token_manager = TokenManager(getattr(provider, 'model', getattr(provider, 'deployment_name', 'gpt-3.5-turbo')))
+        logger.info(f"LLM Client initialized for {analysis_type} analysis")
     
     def analyze_sentiment(
         self,
@@ -447,61 +452,116 @@ class LLMClient:
         total_activities: int = 0,
         **kwargs
     ) -> Dict[str, Any]:
-        """
-        Analyze sentiment using RAG context and activities
-        
-        Args:
-            deal_id: Unique deal identifier
-            activities_text: Combined text of deal activities
-            rag_context: Historical context from RAG system
-            activity_frequency: Recent activity frequency
-            total_activities: Total number of activities
-            **kwargs: Additional parameters for prompt formatting
-            
-        Returns:
-            Structured sentiment analysis result
-        """
-        
-        # Format the prompt using the template
-        prompt = self.prompt_manager.format_prompt(
-            deal_id=deal_id,
-            activities_text=activities_text,
-            rag_context=rag_context,
-            activity_frequency=activity_frequency,
-            total_activities=total_activities,
-            **kwargs
-        )
-        
-        # Generate response with retries
-        response_text = self._generate_with_retries(prompt)
-        
-        # Parse and validate response
-        result = self._parse_and_validate_response(response_text, deal_id)
-        
-        # Add metadata
-        result['analysis_metadata'] = {
-            'provider': self.provider.get_provider_name(),
-            'timestamp': datetime.utcnow().isoformat(),
-            'deal_id': deal_id,
-            'rag_context_length': len(rag_context),
-            'activities_length': len(activities_text),
-            'analysis_type': self.analysis_type
-        }
-        
-        logger.info(f"Completed {self.analysis_type} sentiment analysis for deal {deal_id}")
-        return result
+        op_name = f"analyze_sentiment_{self.analysis_type}"
+        token_count = 0
+        cache_result = None
+        with metrics_collector.track_operation(op_name) as _:
+            try:
+                # Format prompt
+                prompt = self.prompt_manager.format_prompt(
+                    deal_id=deal_id,
+                    activities_text=activities_text,
+                    rag_context=rag_context,
+                    activity_frequency=activity_frequency,
+                    total_activities=total_activities,
+                    **kwargs
+                )
+                # Token management: validate and truncate if needed
+                max_output_tokens = kwargs.get('max_tokens', 2000)
+                if not self.token_manager.validate_context_window(prompt, max_output_tokens):
+                    logger.warning(f"Prompt too long for model context window, truncating for deal {deal_id}")
+                    # Truncate activities_text and reformat prompt
+                    allowed_tokens = self.token_manager.get_token_limit() - max_output_tokens
+                    truncated_activities = self.token_manager.truncate_text(activities_text, allowed_tokens, keep_head=128, keep_tail=128)
+                    prompt = self.prompt_manager.format_prompt(
+                        deal_id=deal_id,
+                        activities_text=truncated_activities,
+                        rag_context=rag_context,
+                        activity_frequency=activity_frequency,
+                        total_activities=total_activities,
+                        **kwargs
+                    )
+                # Check cache first
+                include_rag_context = bool(rag_context.strip())
+                cached_response = self.cache_manager.get_cached_llm_response(
+                    prompt=prompt,
+                    model_name=self.provider.get_provider_name(),
+                    deal_id=deal_id,
+                    analysis_type=self.analysis_type,
+                    include_rag_context=include_rag_context,
+                    cache_version="v1"
+                )
+                
+                if cached_response:
+                    logger.info(f"Cache hit for deal {deal_id} ({self.analysis_type} analysis)")
+                    cache_result = "hit"
+                    # Parse and validate cached response
+                    result = self._parse_and_validate_response(cached_response, deal_id)
+                    result['cache_metadata'] = {
+                        'cached': True,
+                        'cache_timestamp': datetime.utcnow().isoformat(),
+                        'deal_id': deal_id,
+                        'analysis_type': self.analysis_type
+                    }
+                    result['token_metrics'] = self.token_manager.get_usage_metrics()
+                    token_count = result['token_metrics'].get('input_tokens', 0) + result['token_metrics'].get('output_tokens', 0)
+                    metrics_collector.record_token_usage(op_name, token_count)
+                    metrics_collector.record_cache(cache_result)
+                    return result
+                
+                # Generate new response
+                logger.info(f"Cache miss for deal {deal_id} ({self.analysis_type} analysis), generating new response")
+                cache_result = "miss"
+                response_text, input_tokens, output_tokens = self._generate_with_retries_token(prompt, max_output_tokens)
+                # Track token usage
+                token_count = input_tokens + output_tokens
+                metrics_collector.record_token_usage(op_name, token_count)
+                # Cache the response
+                cache_success = self.cache_manager.cache_llm_response(
+                    prompt=prompt,
+                    response=response_text,
+                    model_name=self.provider.get_provider_name(),
+                    deal_id=deal_id,
+                    analysis_type=self.analysis_type,
+                    include_rag_context=include_rag_context,
+                    cache_version="v1"
+                )
+                
+                if cache_success:
+                    logger.info(f"Cached response for deal {deal_id} ({self.analysis_type} analysis)")
+                else:
+                    logger.warning(f"Failed to cache response for deal {deal_id} ({self.analysis_type} analysis)")
+                metrics_collector.record_cache(cache_result)
+                
+                # Parse and validate response
+                result = self._parse_and_validate_response(response_text, deal_id)
+                result['cache_metadata'] = {
+                    'cached': False,
+                    'cache_timestamp': datetime.utcnow().isoformat(),
+                    'deal_id': deal_id,
+                    'analysis_type': self.analysis_type
+                }
+                result['token_metrics'] = self.token_manager.get_usage_metrics()
+                return result
+                
+            except Exception as e:
+                logger.error(f"Error in sentiment analysis for deal {deal_id}: {e}")
+                metrics_collector.record_error(type(e).__name__)
+                raise
     
-    def _generate_with_retries(self, prompt: str) -> str:
-        """Generate response with retry logic"""
+    def _generate_with_retries_token(self, prompt: str, max_output_tokens: int) -> (str, int, int):
+        """Generate response with retry logic and token counting"""
         
         for attempt in range(self.max_retries):
             try:
-                response = self.provider.generate_response(prompt)
+                input_tokens = self.token_manager.count_tokens(prompt)
+                response = self.provider.generate_response(prompt, max_tokens=max_output_tokens)
+                output_tokens = self.token_manager.count_tokens(response)
                 
                 if not response or not response.strip():
                     raise ValueError("Empty response from LLM")
                 
-                return response
+                return response, input_tokens, output_tokens
                 
             except Exception as e:
                 logger.warning(f"LLM generation attempt {attempt + 1} failed: {e}")
@@ -515,7 +575,7 @@ class LLMClient:
         raise RuntimeError("Failed to generate response after all retries")
     
     def _parse_and_validate_response(self, response_text: str, deal_id: str) -> Dict[str, Any]:
-        """Parse and validate the LLM response"""
+        """Parse and validate the LLM response using Pydantic validation"""
         
         try:
             # Clean response text (remove markdown formatting if present)
@@ -524,19 +584,47 @@ class LLMClient:
             # Parse JSON
             result = json.loads(cleaned_response)
             
-            # Validate required fields based on analysis type
-            self._validate_response_structure(result)
+            # Use Pydantic validation system
+            validated_response = validate_llm_response(result, self.analysis_type, deal_id)
             
-            return result
+            # Convert validated response back to dict for compatibility
+            response_dict = validated_response.dict()
+            
+            # Add validation metadata
+            response_dict['validation_metadata'] = {
+                'validated': True,
+                'validation_timestamp': datetime.utcnow().isoformat(),
+                'analysis_type': self.analysis_type,
+                'deal_id': deal_id
+            }
+            
+            logger.info(f"Response validation successful for deal {deal_id} using {self.analysis_type} analysis")
+            return response_dict
             
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response for deal {deal_id}: {e}")
             logger.debug(f"Raw response: {response_text}")
-            raise ValueError(f"Invalid JSON response: {e}")
+            
+            # Return a safe default response
+            validator = get_response_validator()
+            if self.analysis_type == "client":
+                default_response = validator._create_default_client_response(deal_id, f"Invalid JSON: {e}")
+            else:
+                default_response = validator._create_default_sales_response(deal_id, f"Invalid JSON: {e}")
+            
+            return default_response.dict()
         
         except Exception as e:
             logger.error(f"Response validation failed for deal {deal_id}: {e}")
-            raise
+            
+            # Return a safe default response
+            validator = get_response_validator()
+            if self.analysis_type == "client":
+                default_response = validator._create_default_client_response(deal_id, str(e))
+            else:
+                default_response = validator._create_default_sales_response(deal_id, str(e))
+            
+            return default_response.dict()
     
     def _clean_response_text(self, response_text: str) -> str:
         """Clean response text to extract JSON"""
@@ -552,50 +640,6 @@ class LLMClient:
             response_text = json_match.group(0)
         
         return response_text.strip()
-    
-    def _validate_response_structure(self, result: Dict[str, Any]) -> None:
-        """Validate that response has required structure based on analysis type"""
-        
-        # Core required fields that both analyses must have
-        core_required_fields = [
-            'overall_sentiment',
-            'sentiment_score',
-            'confidence',
-            'activity_breakdown',
-            'reasoning'
-        ]
-        
-        # Check core required fields
-        for field in core_required_fields:
-            if field not in result:
-                raise ValueError(f"Missing required field: {field}")
-        
-        # Validate sentiment score range
-        score = result.get('sentiment_score')
-        if not isinstance(score, (int, float)) or not (-1.0 <= score <= 1.0):
-            raise ValueError(f"Invalid sentiment_score: {score}. Must be between -1.0 and 1.0")
-        
-        # Validate confidence range
-        confidence = result.get('confidence')
-        if not isinstance(confidence, (int, float)) or not (0.0 <= confidence <= 1.0):
-            raise ValueError(f"Invalid confidence: {confidence}. Must be between 0.0 and 1.0")
-        
-        # Type-specific validation
-        if self.analysis_type == "sales":
-            # Sales-specific required fields
-            sales_required_fields = ['deal_momentum_indicators']
-            for field in sales_required_fields:
-                if field not in result:
-                    raise ValueError(f"Missing required sales-specific field: {field}")
-        
-        elif self.analysis_type == "client":
-            # Client-specific required fields
-            client_required_fields = ['client_engagement_indicators']
-            for field in client_required_fields:
-                if field not in result:
-                    logger.warning(f"Missing client-specific field: {field} (optional)")
-        
-        logger.debug(f"Response validation passed for {self.analysis_type} analysis")
 
 def create_llm_client(
     provider_name: str, 
