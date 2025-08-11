@@ -28,11 +28,10 @@ class EmbeddingService(ABC):
 
 class SentenceTransformerEmbeddingService(EmbeddingService):
     """Sentence Transformers embedding service (free, local)"""
-    
-    def __init__(self, model_name: str = None):
+    def __init__(self, model_name: str = None, batch_size: int = 32):
         self.model_name = model_name or settings.SENTENCE_TRANSFORMER_MODEL
         self.cache_manager = get_cache_manager()
-        
+        self.batch_size = batch_size
         try:
             from sentence_transformers import SentenceTransformer
             self.model = SentenceTransformer(self.model_name)
@@ -41,52 +40,37 @@ class SentenceTransformerEmbeddingService(EmbeddingService):
             raise ImportError("sentence-transformers library required. Install with: pip install sentence-transformers")
         except Exception as e:
             raise RuntimeError(f"Failed to load SentenceTransformer model: {e}")
-    
+
     def encode(self, text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
-        """Generate embeddings using SentenceTransformer"""
+        """Generate embeddings using SentenceTransformer (batch-optimized)"""
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
-        
+        all_embeddings = [None] * len(texts)
         # Check cache for each text
         cached_embeddings = []
         texts_to_encode = []
         text_indices = []
-        
         for i, txt in enumerate(texts):
             cached_embedding = self.cache_manager.get_cached_embedding(txt, self.model_name)
             if cached_embedding is not None:
-                cached_embeddings.append((i, cached_embedding))
+                all_embeddings[i] = cached_embedding
             else:
                 texts_to_encode.append(txt)
                 text_indices.append(i)
-        
-        # Encode uncached texts
+        # Batch encode uncached texts
         if texts_to_encode:
             try:
-                new_embeddings = self.model.encode(texts_to_encode, convert_to_tensor=False)
-                new_embeddings = [emb.tolist() for emb in new_embeddings]
-                
-                # Cache new embeddings
-                for txt, emb in zip(texts_to_encode, new_embeddings):
-                    self.cache_manager.cache_embedding(txt, emb, self.model_name)
-                
+                for batch_start in range(0, len(texts_to_encode), self.batch_size):
+                    batch = texts_to_encode[batch_start:batch_start + self.batch_size]
+                    batch_embeddings = self.model.encode(batch, convert_to_tensor=False)
+                    batch_embeddings = [emb.tolist() for emb in batch_embeddings]
+                    for txt, emb in zip(batch, batch_embeddings):
+                        idx = text_indices[texts_to_encode.index(txt)]
+                        all_embeddings[idx] = emb
+                        self.cache_manager.cache_embedding(txt, emb, self.model_name)
             except Exception as e:
                 logger.error(f"Error encoding texts: {e}")
                 raise
-        else:
-            new_embeddings = []
-        
-        # Combine cached and new embeddings
-        all_embeddings = [None] * len(texts)
-        
-        # Place cached embeddings
-        for i, emb in cached_embeddings:
-            all_embeddings[i] = emb
-        
-        # Place new embeddings
-        for i, emb in zip(text_indices, new_embeddings):
-            all_embeddings[i] = emb
-        
         return all_embeddings[0] if is_single else all_embeddings
     
     def get_dimension(self) -> int:
@@ -99,72 +83,54 @@ class SentenceTransformerEmbeddingService(EmbeddingService):
 
 class OpenAIEmbeddingService(EmbeddingService):
     """OpenAI embedding service"""
-    
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(self, api_key: str = None, model: str = None, batch_size: int = 32):
         self.api_key = api_key or settings.OPENAI_API_KEY
         self.model = model or settings.OPENAI_EMBEDDING_MODEL
         self.cache_manager = get_cache_manager()
-        
+        self.batch_size = batch_size
         if not self.api_key:
             raise ValueError("OpenAI API key required")
-        
         try:
             import openai
             self.client = openai.OpenAI(api_key=self.api_key)
             logger.info(f"OpenAI embedding service initialized with model: {self.model}")
         except ImportError:
             raise ImportError("openai library required. Install with: pip install openai")
-    
+
     def encode(self, text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
-        """Generate embeddings using OpenAI"""
+        """Generate embeddings using OpenAI (batch-optimized)"""
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
-        
+        all_embeddings = [None] * len(texts)
         # Check cache for each text
         cached_embeddings = []
         texts_to_encode = []
         text_indices = []
-        
         for i, txt in enumerate(texts):
             cached_embedding = self.cache_manager.get_cached_embedding(txt, self.model)
             if cached_embedding is not None:
-                cached_embeddings.append((i, cached_embedding))
+                all_embeddings[i] = cached_embedding
             else:
                 texts_to_encode.append(txt)
                 text_indices.append(i)
-        
-        # Encode uncached texts
+        # Batch encode uncached texts
         if texts_to_encode:
             try:
-                response = self.client.embeddings.create(
-                    model=self.model,
-                    input=texts_to_encode,
-                    encoding_format="float"
-                )
-                
-                new_embeddings = [data.embedding for data in response.data]
-                
-                # Cache new embeddings
-                for txt, emb in zip(texts_to_encode, new_embeddings):
-                    self.cache_manager.cache_embedding(txt, emb, self.model)
-                
+                for batch_start in range(0, len(texts_to_encode), self.batch_size):
+                    batch = texts_to_encode[batch_start:batch_start + self.batch_size]
+                    response = self.client.embeddings.create(
+                        model=self.model,
+                        input=batch,
+                        encoding_format="float"
+                    )
+                    batch_embeddings = [data.embedding for data in response.data]
+                    for txt, emb in zip(batch, batch_embeddings):
+                        idx = text_indices[texts_to_encode.index(txt)]
+                        all_embeddings[idx] = emb
+                        self.cache_manager.cache_embedding(txt, emb, self.model)
             except Exception as e:
                 logger.error(f"Error with OpenAI embedding API: {e}")
                 raise
-        else:
-            new_embeddings = []
-        
-        # Combine cached and new embeddings
-        all_embeddings = [None] * len(texts)
-        
-        # Place cached embeddings
-        for i, emb in cached_embeddings:
-            all_embeddings[i] = emb
-        
-        # Place new embeddings
-        for i, emb in zip(text_indices, new_embeddings):
-            all_embeddings[i] = emb
-        
         return all_embeddings[0] if is_single else all_embeddings
     
     def get_dimension(self) -> int:
@@ -182,84 +148,61 @@ class OpenAIEmbeddingService(EmbeddingService):
 
 class HuggingFaceEmbeddingService(EmbeddingService):
     """HuggingFace embedding service"""
-    
-    def __init__(self, model_name: str = None):
+    def __init__(self, model_name: str = None, batch_size: int = 32):
         self.model_name = model_name or settings.HUGGINGFACE_MODEL
         self.cache_manager = get_cache_manager()
-        
+        self.batch_size = batch_size
         try:
             from transformers import AutoTokenizer, AutoModel
             import torch
-            
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             self.model = AutoModel.from_pretrained(self.model_name)
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             self.model.to(self.device)
-            
             logger.info(f"HuggingFace model loaded: {self.model_name}")
         except ImportError:
             raise ImportError("transformers and torch libraries required. Install with: pip install transformers torch")
-    
+
     def encode(self, text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
-        """Generate embeddings using HuggingFace model"""
+        """Generate embeddings using HuggingFace model (batch-optimized)"""
         is_single = isinstance(text, str)
         texts = [text] if is_single else text
-        
+        all_embeddings = [None] * len(texts)
         # Check cache for each text
         cached_embeddings = []
         texts_to_encode = []
         text_indices = []
-        
         for i, txt in enumerate(texts):
             cached_embedding = self.cache_manager.get_cached_embedding(txt, self.model_name)
             if cached_embedding is not None:
-                cached_embeddings.append((i, cached_embedding))
+                all_embeddings[i] = cached_embedding
             else:
                 texts_to_encode.append(txt)
                 text_indices.append(i)
-        
-        # Encode uncached texts
+        # Batch encode uncached texts
         if texts_to_encode:
             try:
                 import torch
-                
-                # Tokenize
-                inputs = self.tokenizer(
-                    texts_to_encode,
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                    return_tensors="pt"
-                ).to(self.device)
-                
-                # Generate embeddings
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
-                    embeddings = outputs.last_hidden_state.mean(dim=1)
-                
-                new_embeddings = embeddings.cpu().numpy().tolist()
-                
-                # Cache new embeddings
-                for txt, emb in zip(texts_to_encode, new_embeddings):
-                    self.cache_manager.cache_embedding(txt, emb, self.model_name)
-                
+                for batch_start in range(0, len(texts_to_encode), self.batch_size):
+                    batch = texts_to_encode[batch_start:batch_start + self.batch_size]
+                    inputs = self.tokenizer(
+                        batch,
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors="pt"
+                    ).to(self.device)
+                    with torch.no_grad():
+                        outputs = self.model(**inputs)
+                        embeddings = outputs.last_hidden_state.mean(dim=1)
+                    batch_embeddings = embeddings.cpu().numpy().tolist()
+                    for txt, emb in zip(batch, batch_embeddings):
+                        idx = text_indices[texts_to_encode.index(txt)]
+                        all_embeddings[idx] = emb
+                        self.cache_manager.cache_embedding(txt, emb, self.model_name)
             except Exception as e:
                 logger.error(f"Error encoding texts with HuggingFace: {e}")
                 raise
-        else:
-            new_embeddings = []
-        
-        # Combine cached and new embeddings
-        all_embeddings = [None] * len(texts)
-        
-        # Place cached embeddings
-        for i, emb in cached_embeddings:
-            all_embeddings[i] = emb
-        
-        # Place new embeddings
-        for i, emb in zip(text_indices, new_embeddings):
-            all_embeddings[i] = emb
-        
         return all_embeddings[0] if is_single else all_embeddings
     
     def get_dimension(self) -> int:

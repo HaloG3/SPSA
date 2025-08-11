@@ -203,31 +203,57 @@ class KnowledgeBaseBuilder:
         return stats
     
     def _process_deal_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Process a batch of deals"""
-        
+        """Process a batch of deals with batch embedding generation"""
         batch_stats = {
             'processed': len(batch),
             'successful': 0,
             'failed': 0
         }
-        
         deal_patterns = []
-        
-        for deal in batch:
+        processed_deals = []
+        texts_to_embed = []
+        deal_indices = []
+        # First, process deals to extract combined_texts
+        for idx, deal in enumerate(batch):
             try:
-                # Process deal data
                 processed_deal = self.data_processor.process_deal(deal)
-                
-                # Create deal pattern for vector storage
-                deal_pattern = self._create_deal_pattern(processed_deal)
-                deal_patterns.append(deal_pattern)
-                
-                batch_stats['successful'] += 1
-                
+                processed_deals.append(processed_deal)
+                texts_to_embed.append(processed_deal.combined_text)
+                deal_indices.append(idx)
             except Exception as e:
                 logger.error(f"Error processing deal {deal.get('deal_id', 'unknown')}: {e}")
                 batch_stats['failed'] += 1
-        
+                processed_deals.append(None)
+        # Batch embed all combined_texts
+        embeddings = []
+        if texts_to_embed:
+            try:
+                embeddings = self.embedding_service.encode(texts_to_embed)
+            except Exception as e:
+                logger.error(f"Error batch embedding: {e}")
+                # If batch fails, fallback to single embedding per text
+                embeddings = []
+                for text in texts_to_embed:
+                    try:
+                        emb = self.embedding_service.encode(text)
+                        embeddings.append(emb)
+                    except Exception as e2:
+                        logger.error(f"Error embedding single text: {e2}")
+                        embeddings.append(None)
+        # Assign embeddings to processed_deals
+        emb_idx = 0
+        for idx, processed_deal in enumerate(processed_deals):
+            if processed_deal is not None:
+                embedding = embeddings[emb_idx] if emb_idx < len(embeddings) else None
+                processed_deal.embedding = embedding
+                try:
+                    deal_pattern = self._create_deal_pattern(processed_deal)
+                    deal_patterns.append(deal_pattern)
+                    batch_stats['successful'] += 1
+                except Exception as e:
+                    logger.error(f"Error creating deal pattern: {e}")
+                    batch_stats['failed'] += 1
+                emb_idx += 1
         # Store batch in vector database
         if deal_patterns:
             try:
@@ -237,7 +263,6 @@ class KnowledgeBaseBuilder:
                 logger.error(f"Error storing deal patterns: {e}")
                 batch_stats['failed'] += len(deal_patterns)
                 batch_stats['successful'] -= len(deal_patterns)
-        
         return batch_stats
     
     def _create_deal_pattern(self, processed_deal: ProcessedDealData) -> DealPattern:
